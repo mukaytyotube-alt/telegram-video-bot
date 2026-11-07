@@ -31,7 +31,7 @@ dp = Dispatcher()
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("Привет! Отправь мне ссылку на видео, и я скачаю его для тебя.")
+    await message.answer("Привет! Отправь мне ссылку на видео (YouTube, TikTok и др.), и я скачаю его для тебя.")
 
 def download_video(url: str) -> str:
     ydl_opts = {
@@ -40,6 +40,10 @@ def download_video(url: str) -> str:
         'overwrites': True,
         'quiet': True,
         'no_warnings': True,
+        # Маскировка под браузер для обхода защиты TikTok и других сайтов
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
