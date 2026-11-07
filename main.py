@@ -4,6 +4,7 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 import yt_dlp
 
 # Веб-сервер-заглушка для Render (чтобы проходила проверка портов)
@@ -21,7 +22,7 @@ def run_server():
 # Запускаем веб-сервер в фоновом потоке
 threading.Thread(target=run_server, daemon=True).start()
 
-# Инициализация Telegram-бота из переменных окружения Render
+# Инициализация Telegram-бота
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("Не найден BOT_TOKEN в переменных окружения Render!")
@@ -29,9 +30,51 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# Ваши каналы для обязательной подписки
+CHANNEL_1 = "@digital_author_ai"
+CHANNEL_2 = "@Russia_RB"
+
+async def check_subscriptions(user_id: int) -> bool:
+    channels = [CHANNEL_1, CHANNEL_2]
+    for channel in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+            if member.status not in ["member", "administrator", "creator"]:
+                return False
+        except Exception:
+            return False
+    return True
+
+def get_sub_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="📢 Подписаться на digital_author_ai", url=f"https://t.me/{CHANNEL_1.replace('@', '')}"))
+    builder.row(types.InlineKeyboardButton(text="📢 Подписаться на Russia_RB", url=f"https://t.me/{CHANNEL_2.replace('@', '')}"))
+    builder.row(types.InlineKeyboardButton(text="✅ Я подписался(-ась)", callback_data="check_sub"))
+    return builder.as_markup()
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    is_subbed = await check_subscriptions(user_id)
+    
+    if not is_subbed:
+        await message.answer(
+            "👋 Привет! Чтобы пользоваться ботом, пожалуйста, подпишитесь на наши каналы:",
+            reply_markup=get_sub_keyboard()
+        )
+        return
+
     await message.answer("Привет! Отправь мне ссылку на видео (YouTube, TikTok и др.), и я скачаю его для тебя.")
+
+@dp.callback_query(lambda c: c.data == "check_sub")
+async def process_check_sub(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    is_subbed = await check_subscriptions(user_id)
+    
+    if is_subbed:
+        await callback.message.edit_text("✅ Спасибо за подписку! Теперь отправьте мне ссылку на видео.")
+    else:
+        await callback.answer("❌ Вы подписались еще не на все каналы!", show_alert=True)
 
 def download_video(url: str) -> str:
     ydl_opts = {
@@ -40,7 +83,6 @@ def download_video(url: str) -> str:
         'overwrites': True,
         'quiet': True,
         'no_warnings': True,
-        # Маскировка под браузер для обхода защиты TikTok и других сайтов
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         },
@@ -52,6 +94,16 @@ def download_video(url: str) -> str:
 
 @dp.message()
 async def handle_message(message: types.Message):
+    user_id = message.from_user.id
+    is_subbed = await check_subscriptions(user_id)
+    
+    if not is_subbed:
+        await message.answer(
+            "⚠️ Для использования бота необходимо подписаться на каналы:",
+            reply_markup=get_sub_keyboard()
+        )
+        return
+
     url = message.text.strip()
     if not url.startswith("http"):
         await message.answer("Пожалуйста, отправьте корректную ссылку на видео.")
@@ -70,13 +122,4 @@ async def handle_message(message: types.Message):
         await msg.edit_text(f"Не удалось скачать видео. Ошибка: {e}")
     finally:
         if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except:
-                pass
-
-async def main():
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            try
