@@ -5,9 +5,7 @@ from aiogram.filters import CommandStart
 import yt_dlp
 
 # Вставь свой токен вместо текста внутри кавычек
-TOKEN = "9239415942:AAGVmZsTkZeNR8dZeqysBn3aB1r-OCoNrrw
-"
-
+TOKEN = "9239415942:AAGVmZsTkZeNR8dZeqysBn3aB1r-OCoNrrw"
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
