@@ -122,4 +122,13 @@ async def handle_message(message: types.Message):
         await msg.edit_text(f"Не удалось скачать видео. Ошибка: {e}")
     finally:
         if file_path and os.path.exists(file_path):
-            try
+            try:
+                os.remove(file_path)
+            except:
+                pass
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
