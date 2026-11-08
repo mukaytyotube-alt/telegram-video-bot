@@ -160,7 +160,4 @@ async def check_and_update_limit(user_id: int) -> tuple[bool, str]:
                 f"❌ Лимит скачиваний исчерпан!\n"
                 f"Ваш тариф: {tarif_name} ({downloads}/{limit}).\n"
                 f"Лимит обновится через 24 часа.\n\n"
-                f"💡 Хотите увеличить до 50 скачиваний? Оформите **Premium** всего за 100 Stars с помощью команды /buy!"
-            )
-
-        # Увеличи
+                
