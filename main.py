@@ -1,31 +1,60 @@
+
 import os
 import asyncio
 import logging
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
-
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import LabeledPrice, PreCheckoutQuery
-from supabase import create_client, Client
+
 import yt_dlp
 
-# Логирование
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import CommandStart, Command
+from aiogram.exceptions import TelegramConflictError
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import LabeledPrice, PreCheckoutQuery
+
+from supabase import create_client, Client
+
+
+# ==========================================
+# 1. ЛОГИРОВАНИЕ
+# ==========================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# HTTP-сервер для Render
+logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# 2. HTTP-СЕРВЕР ДЛЯ RENDER И UPTIMEROBOT
+# ==========================================
+
+bot_ready = threading.Event()
+
+
 class SimpleHandler(BaseHTTPRequestHandler):
+
     def do_GET(self):
+
         if self.path in ("/", "/health"):
-            self.send_response(200)
+
+            if bot_ready.is_set():
+                self.send_response(200)
+                response = b"Bot is active"
+            else:
+                self.send_response(503)
+                response = b"Bot is not ready"
+
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(response)))
             self.end_headers()
-            self.wfile.write(b"Bot is active")
+            self.wfile.write(response)
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -35,114 +64,205 @@ class SimpleHandler(BaseHTTPRequestHandler):
 
 
 def run_server():
+
     port = int(os.environ.get("PORT", 10000))
-    server = ThreadingHTTPServer(("0.0.0.0", port), SimpleHandler)
-    logging.info(f"HTTP server started on port {port}")
+
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", port),
+        SimpleHandler
+    )
+
+    logger.info(f"HTTP server started on port {port}")
+
     server.serve_forever()
 
 
-threading.Thread(target=run_server, daemon=True).start()
+threading.Thread(
+    target=run_server,
+    daemon=True
+).start()
 
-# Переменные окружения
+
+# ==========================================
+# 3. ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# ==========================================
+
 TOKEN = os.getenv("BOT_TOKEN")
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+
 if not TOKEN:
-    raise ValueError("Не найден BOT_TOKEN в переменных окружения!")
+    raise ValueError("Не найден BOT_TOKEN!")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logger.warning(
+        "Supabase не настроен. Лимиты и Premium работать корректно не будут."
+    )
+
+
+# ==========================================
+# 4. ИНИЦИАЛИЗАЦИЯ БОТА И БАЗЫ ДАННЫХ
+# ==========================================
 
 bot = Bot(token=TOKEN)
+
 dp = Dispatcher()
 
-# Инициализация Supabase
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+supabase: Client = (
+    create_client(SUPABASE_URL, SUPABASE_KEY)
+    if SUPABASE_URL and SUPABASE_KEY
+    else None
+)
 
-# Каналы для обязательной подписки
+
+# ==========================================
+# 5. НАСТРОЙКИ КАНАЛОВ
+# ==========================================
+
 CHANNEL_1 = "@digital_author_ai"
 CHANNEL_2 = "@Russia_RB"
 
 
+# ==========================================
+# 6. ПРОВЕРКА ПОДПИСКИ
+# ==========================================
+
 async def check_subscriptions(user_id: int) -> bool:
+
     for channel in [CHANNEL_1, CHANNEL_2]:
+
         try:
+
             member = await bot.get_chat_member(
                 chat_id=channel,
                 user_id=user_id
             )
 
-            if member.status not in ["member", "administrator", "creator"]:
+            if member.status not in [
+                "member",
+                "administrator",
+                "creator"
+            ]:
                 return False
 
         except Exception:
-            logging.exception(f"Ошибка проверки подписки: {channel}")
+
+            logger.exception(
+                f"Ошибка проверки подписки: {channel}"
+            )
+
             return False
 
     return True
 
 
 def get_sub_keyboard():
+
     builder = InlineKeyboardBuilder()
 
-    builder.row(types.InlineKeyboardButton(
-        text="📢 Подписаться на digital_author_ai",
-        url="https://t.me/digital_author_ai"
-    ))
+    builder.row(
+        types.InlineKeyboardButton(
+            text="📢 Подписаться на digital_author_ai",
+            url="https://t.me/digital_author_ai"
+        )
+    )
 
-    builder.row(types.InlineKeyboardButton(
-        text="📢 Подписаться на Russia_RB",
-        url="https://t.me/Russia_RB"
-    ))
+    builder.row(
+        types.InlineKeyboardButton(
+            text="📢 Подписаться на Russia_RB",
+            url="https://t.me/Russia_RB"
+        )
+    )
 
-    builder.row(types.InlineKeyboardButton(
-        text="✅ Я подписался(-ась)",
-        callback_data="check_sub"
-    ))
+    builder.row(
+        types.InlineKeyboardButton(
+            text="✅ Я подписался(-ась)",
+            callback_data="check_sub"
+        )
+    )
 
     return builder.as_markup()
 
 
-# Функция проверки и обновления лимитов в Supabase
+# ==========================================
+# 7. ЛИМИТЫ И SUPABASE
+# ==========================================
+
 async def check_and_update_limit(user_id: int) -> tuple[bool, str]:
+
     if not supabase:
         return True, ""
 
     now = datetime.now(timezone.utc)
 
     try:
-        response = supabase.table("users").select("*").eq("user_id", user_id).execute()
+
+        response = (
+            supabase.table("users")
+            .select("*")
+            .eq("user_id", user_id)
+            .execute()
+        )
+
         user_data = response.data
 
         if not user_data:
+
             supabase.table("users").insert({
                 "user_id": user_id,
                 "downloads_count": 0,
                 "last_reset": now.isoformat(),
                 "is_premium": False
             }).execute()
+
             is_premium = False
             downloads = 0
             last_reset = now
+
         else:
+
             user = user_data[0]
+
             is_premium = user.get("is_premium", False)
             downloads = user.get("downloads_count", 0)
+
             last_reset_str = user.get("last_reset")
             premium_until_str = user.get("premium_until")
 
-            last_reset = datetime.fromisoformat(last_reset_str.replace("Z", "+00:00")) if last_reset_str else now
+            last_reset = (
+                datetime.fromisoformat(
+                    last_reset_str.replace("Z", "+00:00")
+                )
+                if last_reset_str
+                else now
+            )
+
+            # Проверка окончания Premium
 
             if is_premium and premium_until_str:
-                premium_until = datetime.fromisoformat(premium_until_str.replace("Z", "+00:00"))
+
+                premium_until = datetime.fromisoformat(
+                    premium_until_str.replace("Z", "+00:00")
+                )
+
                 if now > premium_until:
+
                     is_premium = False
+
                     supabase.table("users").update({
                         "is_premium": False,
                         "premium_until": None
                     }).eq("user_id", user_id).execute()
 
+            # Сброс лимита через 24 часа
+
             if now - last_reset >= timedelta(hours=24):
+
                 downloads = 0
                 last_reset = now
+
                 supabase.table("users").update({
                     "downloads_count": 0,
                     "last_reset": now.isoformat()
@@ -151,209 +271,418 @@ async def check_and_update_limit(user_id: int) -> tuple[bool, str]:
         limit = 50 if is_premium else 5
 
         if downloads >= limit:
-            tarif_name = "🌟 Premium" if is_premium else "Free"
-            return False, f"❌ Лимит исчерпан! Тариф: {tarif_name} ({downloads}/{limit}). Обновление через 24 часа. Хотите больше? Оформите Premium через /buy за 100 Stars!"
+
+            tarif_name = (
+                "🌟 Premium" if is_premium else "Free"
+            )
+
+            return False, (
+                f"❌ Лимит исчерпан!\n\n"
+                f"Тариф: {tarif_name}\n"
+                f"Использовано: {downloads}/{limit}\n\n"
+                f"Обновление через 24 часа.\n"
+                f"Оформите Premium через /buy за 100 Stars!"
+            )
 
         new_downloads = downloads + 1
+
         supabase.table("users").update({
             "downloads_count": new_downloads
         }).eq("user_id", user_id).execute()
 
         return True, ""
 
-    except Exception as e:
-        logging.exception(f"Ошибка при проверке лимитов в Supabase: {e}")
+    except Exception:
+
+        logger.exception(
+            "Ошибка при проверке лимитов Supabase"
+        )
+
         return True, ""
 
 
+# ==========================================
+# 8. КОМАНДА START
+# ==========================================
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+
     user_id = message.from_user.id
 
     if not await check_subscriptions(user_id):
+
         await message.answer(
-            "👋 Привет! Чтобы пользоваться ботом, "
+            "👋 Привет!\n\n"
+            "Чтобы пользоваться ботом, "
             "подпишитесь на наши каналы:",
             reply_markup=get_sub_keyboard()
         )
+
         return
 
     await message.answer(
         "👋 Привет! Отправь мне ссылку на видео "
-        "(YouTube, TikTok и др.), и я скачаю его для тебя.\n\n"
+        "(YouTube, TikTok и другие площадки), "
+        "и я скачаю его для тебя.\n\n"
         "📦 **Тарифы:**\n"
         "• **Free:** 5 скачиваний в сутки\n"
-        "• **Premium:** 50 скачиваний в сутки (100 Stars / 30 дней)\n\n"
-        "💳 Используй команду /buy, чтобы купить Premium."
+        "• **Premium:** 50 скачиваний в сутки\n"
+        "• **Стоимость Premium:** 100 Stars / 30 дней\n\n"
+        "💳 Используй команду /buy, чтобы купить Premium.",
+        parse_mode="Markdown"
     )
 
 
+# ==========================================
+# 9. ПРОВЕРКА ПОДПИСКИ ПО КНОПКЕ
+# ==========================================
+
 @dp.callback_query(lambda c: c.data == "check_sub")
 async def process_check_sub(callback: types.CallbackQuery):
+
     user_id = callback.from_user.id
 
     if await check_subscriptions(user_id):
+
         await callback.message.edit_text(
-            "✅ Спасибо за подписку! Теперь отправьте ссылку на видео."
+            "✅ Спасибо за подписку!\n\n"
+            "Теперь отправьте ссылку на видео."
         )
+
         await callback.answer()
+
     else:
+
         await callback.answer(
-            "❌ Вы подписались еще не на все каналы!",
+            "❌ Вы подписались ещё не на все каналы!",
             show_alert=True
         )
 
 
-# Команда покупки Premium подписки (100 Stars за 30 дней)
+# ==========================================
+# 10. ПОКУПКА PREMIUM
+# ==========================================
+
 @dp.message(Command("buy"))
 async def cmd_buy(message: types.Message):
+
     await message.answer_invoice(
         title="🌟 Premium подписка (30 дней)",
-        description="Увеличение лимита скачиваний до 50 в сутки на 30 дней.",
+
+        description=(
+            "Увеличение лимита скачиваний "
+            "до 50 видео в сутки на 30 дней."
+        ),
+
         payload="premium_30_days",
+
         currency="XTR",
-        prices=[LabeledPrice(label="30 дней Premium", amount=100)],
+
+        prices=[
+            LabeledPrice(
+                label="30 дней Premium",
+                amount=100
+            )
+        ]
     )
 
 
-# Предпроверка перед оплатой
+# ==========================================
+# 11. ПРЕДПРОВЕРКА ОПЛАТЫ
+# ==========================================
+
 @dp.pre_checkout_query()
 async def pre_checkout_handler(query: PreCheckoutQuery):
+
     await query.answer(ok=True)
 
 
-# Успешная оплата (начисление Premium)
+# ==========================================
+# 12. УСПЕШНАЯ ОПЛАТА
+# ==========================================
+
 @dp.message(F.successful_payment)
 async def successful_payment_handler(message: types.Message):
+
     user_id = message.from_user.id
+
     now = datetime.now(timezone.utc)
+
     premium_until = now + timedelta(days=30)
 
     if supabase:
+
         try:
-            supabase.table("users").update({
-                "is_premium": True,
-                "premium_until": premium_until.isoformat()
-            }).eq("user_id", user_id).execute()
+
+            supabase.table("users").upsert(
+                {
+                    "user_id": user_id,
+                    "is_premium": True,
+                    "premium_until": premium_until.isoformat()
+                },
+                on_conflict="user_id"
+            ).execute()
+
         except Exception:
-            logging.exception("Ошибка обновления Premium статуса в Supabase")
+
+            logger.exception(
+                "Ошибка обновления Premium в Supabase"
+            )
+
+            await message.answer(
+                "⚠️ Оплата получена, но возникла ошибка "
+                "активации Premium. Обратитесь в поддержку."
+            )
+
+            return
 
     await message.answer(
         "🎉 **Оплата прошла успешно!**\n\n"
-        "Вам активирован тариф **🌟 Premium** на 30 дней.\n"
-        "Ваш лимит увеличен до **50 скачиваний в сутки**. Приятного использования!"
+        "Вам активирован тариф 🌟 **Premium** на 30 дней.\n\n"
+        "Ваш лимит увеличен до **50 скачиваний в сутки**.\n"
+        "Приятного использования!",
+        parse_mode="Markdown"
     )
 
 
-# Скачивание видео
+# ==========================================
+# 13. СКАЧИВАНИЕ ВИДЕО
+# ==========================================
+
 def download_video(url: str) -> str:
+
     unique_name = uuid.uuid4().hex
 
     ydl_opts = {
+
         "format": "best[ext=mp4]/best",
+
         "outtmpl": f"video_{unique_name}.%(ext)s",
+
         "overwrites": True,
+
         "quiet": True,
+
         "no_warnings": True,
+
+        "noplaylist": True,
+
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+                "AppleWebKit/537.36 Chrome/120.0.0.0 "
+                "Safari/537.36"
             )
-        },
+        }
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+
+        info = ydl.extract_info(
+            url,
+            download=True
+        )
+
         return ydl.prepare_filename(info)
 
 
+# ==========================================
+# 14. ОБРАБОТКА СООБЩЕНИЙ
+# ==========================================
+
 @dp.message()
 async def handle_message(message: types.Message):
+
     if not message.text:
-        await message.answer("Пожалуйста, отправьте ссылку на видео.")
+
+        await message.answer(
+            "Пожалуйста, отправьте ссылку на видео."
+        )
+
         return
 
     user_id = message.from_user.id
 
     if not await check_subscriptions(user_id):
+
         await message.answer(
-            "⚠️ Для использования бота необходимо подписаться на каналы:",
+            "⚠️ Для использования бота "
+            "необходимо подписаться на каналы:",
             reply_markup=get_sub_keyboard()
         )
+
         return
 
     url = message.text.strip()
 
     if not url.startswith(("http://", "https://")):
-        await message.answer("Пожалуйста, отправьте корректную ссылку.")
+
+        await message.answer(
+            "Пожалуйста, отправьте корректную ссылку."
+        )
+
         return
 
     allowed, limit_msg = await check_and_update_limit(user_id)
+
     if not allowed:
+
         await message.answer(limit_msg)
+
         return
 
-    msg = await message.answer("⏳ Скачиваю видео...")
+    msg = await message.answer(
+        "⏳ Скачиваю видео..."
+    )
+
     file_path = None
 
     try:
-        file_path = await asyncio.to_thread(download_video, url)
 
-        await msg.edit_text("📤 Загружаю видео...")
+        file_path = await asyncio.to_thread(
+            download_video,
+            url
+        )
+
+        if not os.path.exists(file_path):
+
+            raise FileNotFoundError(
+                "Скачанный видеофайл не найден."
+            )
+
+        await msg.edit_text(
+            "📤 Загружаю видео в Telegram..."
+        )
 
         video_file = types.FSInputFile(file_path)
-        await message.answer_video(video=video_file)
+
+        await message.answer_video(
+            video=video_file
+        )
 
         await msg.delete()
 
     except Exception as e:
-        logging.exception("Ошибка скачивания видео")
+
+        logger.exception(
+            "Ошибка скачивания или отправки видео"
+        )
 
         try:
+
             await msg.edit_text(
-                f"❌ Не удалось скачать видео: {str(e)[:3000]}"
+                f"❌ Не удалось скачать или отправить видео.\n\n"
+                f"Причина: {str(e)[:1000]}"
             )
+
         except Exception:
             pass
 
     finally:
+
         if file_path and os.path.exists(file_path):
+
             try:
+
                 os.remove(file_path)
+
             except OSError:
-                logging.exception("Не удалось удалить видеофайл")
+
+                logger.exception(
+                    "Не удалось удалить видеофайл"
+                )
 
 
-# Запуск с восстановлением после неожиданных ошибок
+# ==========================================
+# 15. ЗАПУСК И ВОССТАНОВЛЕНИЕ БОТА
+# ==========================================
+
 async def main():
-    while True:
-        try:
-            logging.info("Запуск Telegram polling...")
 
-            await dp.start_polling(
-                bot,
-                close_bot_session=False
-            )
+    try:
 
-            logging.warning("Polling завершился.")
-            break
+        while True:
 
-        except asyncio.CancelledError:
-            raise
+            try:
 
-        except Exception:
-            logging.exception(
-                "Бот неожиданно остановился. "
-                "Повторный запуск через 5 секунд..."
-            )
-            await asyncio.sleep(5)
+                logger.info(
+                    "Проверка подключения к Telegram..."
+                )
 
-    await bot.session.close()
+                me = await bot.get_me()
 
+                logger.info(
+                    f"Бот подключён: @{me.username}"
+                )
+
+                bot_ready.set()
+
+                logger.info(
+                    "Запуск Telegram polling..."
+                )
+
+                await dp.start_polling(
+                    bot,
+                    close_bot_session=False
+                )
+
+                logger.warning(
+                    "Telegram polling завершился."
+                )
+
+                break
+
+            except TelegramConflictError:
+
+                bot_ready.clear()
+
+                logger.critical(
+                    "ОШИБКА 409 CONFLICT: "
+                    "Другой экземпляр бота уже получает обновления. "
+                    "Проверьте все места запуска и Render Scaling."
+                )
+
+                raise
+
+            except asyncio.CancelledError:
+
+                raise
+
+            except Exception:
+
+                bot_ready.clear()
+
+                logger.exception(
+                    "Ошибка подключения к Telegram. "
+                    "Повтор через 15 секунд."
+                )
+
+                await asyncio.sleep(15)
+
+    finally:
+
+        bot_ready.clear()
+
+        await bot.session.close()
+
+        logger.info(
+            "Сессия Telegram закрыта."
+        )
+
+
+# ==========================================
+# 16. ТОЧКА ВХОДА
+# ==========================================
 
 if __name__ == "__main__":
+
     try:
+
         asyncio.run(main())
+
     except KeyboardInterrupt:
-        logging.info("Бот остановлен.")
+
+        logger.info(
+            "Бот остановлен вручную."
+        )
