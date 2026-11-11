@@ -6,6 +6,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import metadata
 
 import yt_dlp
 
@@ -18,10 +19,6 @@ from aiogram.types import LabeledPrice, PreCheckoutQuery
 from supabase import create_client, Client
 
 
-# ==========================================
-# 1. LOGGING
-# ==========================================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -29,9 +26,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ==========================================
-# 2. RENDER HEALTH SERVER
-# ==========================================
+def log_package_version(package_name):
+    try:
+        logger.info("%s version: %s", package_name, metadata.version(package_name))
+    except metadata.PackageNotFoundError:
+        logger.warning("%s is not installed", package_name)
+
+
+logger.info("yt-dlp version: %s", yt_dlp.version.__version__)
+log_package_version("curl-cffi")
+log_package_version("bgutil-ytdlp-pot-provider")
+
 
 bot_ready = threading.Event()
 
@@ -60,20 +65,13 @@ class SimpleHandler(BaseHTTPRequestHandler):
 
 def run_server():
     port = int(os.environ.get("PORT", 10000))
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", port),
-        SimpleHandler
-    )
-    logger.info("HTTP server started on port %s", port)
+    server = ThreadingHTTPServer(("0.0.0.0", port), SimpleHandler)
+    logger.info("HTTP health server started on port %s", port)
     server.serve_forever()
 
 
 threading.Thread(target=run_server, daemon=True).start()
 
-
-# ==========================================
-# 3. ENVIRONMENT VARIABLES
-# ==========================================
 
 TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -83,12 +81,8 @@ if not TOKEN:
     raise ValueError("Не найден BOT_TOKEN!")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.warning("Supabase не настроен.")
+    logger.warning("Supabase не настроен. Лимиты не будут сохраняться.")
 
-
-# ==========================================
-# 4. BOT AND DATABASE
-# ==========================================
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -100,70 +94,41 @@ supabase: Client = (
 )
 
 
-# ==========================================
-# 5. CHANNELS
-# ==========================================
-
 CHANNEL_1 = "@digital_author_ai"
 CHANNEL_2 = "@Russia_RB"
 
 
-# ==========================================
-# 6. SUBSCRIPTION CHECK
-# ==========================================
-
 async def check_subscriptions(user_id: int) -> bool:
-    for channel in [CHANNEL_1, CHANNEL_2]:
+    for channel in (CHANNEL_1, CHANNEL_2):
         try:
             member = await bot.get_chat_member(
                 chat_id=channel,
                 user_id=user_id
             )
-
-            if member.status not in [
-                "member", "administrator", "creator"
-            ]:
+            if member.status not in ("member", "administrator", "creator"):
                 return False
-
         except Exception:
-            logger.exception(
-                "Ошибка проверки подписки: %s", channel
-            )
+            logger.exception("Ошибка проверки подписки: %s", channel)
             return False
-
     return True
 
 
 def get_sub_keyboard():
     builder = InlineKeyboardBuilder()
-
-    builder.row(
-        types.InlineKeyboardButton(
-            text="📢 Подписаться на digital_author_ai",
-            url="https://t.me/digital_author_ai"
-        )
-    )
-
-    builder.row(
-        types.InlineKeyboardButton(
-            text="📢 Подписаться на Russia_RB",
-            url="https://t.me/Russia_RB"
-        )
-    )
-
-    builder.row(
-        types.InlineKeyboardButton(
-            text="✅ Я подписался(-ась)",
-            callback_data="check_sub"
-        )
-    )
-
+    builder.row(types.InlineKeyboardButton(
+        text="📢 Подписаться на digital_author_ai",
+        url="https://t.me/digital_author_ai"
+    ))
+    builder.row(types.InlineKeyboardButton(
+        text="📢 Подписаться на Russia_RB",
+        url="https://t.me/Russia_RB"
+    ))
+    builder.row(types.InlineKeyboardButton(
+        text="✅ Я подписался(-ась)",
+        callback_data="check_sub"
+    ))
     return builder.as_markup()
 
-
-# ==========================================
-# 7. LIMITS AND SUPABASE
-# ==========================================
 
 async def check_and_update_limit(user_id: int):
     if not supabase:
@@ -178,7 +143,6 @@ async def check_and_update_limit(user_id: int):
             .eq("user_id", user_id)
             .execute()
         )
-
         user_data = response.data
 
         if not user_data:
@@ -188,14 +152,11 @@ async def check_and_update_limit(user_id: int):
                 "last_reset": now.isoformat(),
                 "is_premium": False
             }).execute()
-
             is_premium = False
             downloads = 0
             last_reset = now
-
         else:
             user = user_data[0]
-
             is_premium = user.get("is_premium", False)
             downloads = user.get("downloads_count", 0)
 
@@ -203,9 +164,7 @@ async def check_and_update_limit(user_id: int):
             premium_until_str = user.get("premium_until")
 
             last_reset = (
-                datetime.fromisoformat(
-                    last_reset_str.replace("Z", "+00:00")
-                )
+                datetime.fromisoformat(last_reset_str.replace("Z", "+00:00"))
                 if last_reset_str else now
             )
 
@@ -213,10 +172,8 @@ async def check_and_update_limit(user_id: int):
                 premium_until = datetime.fromisoformat(
                     premium_until_str.replace("Z", "+00:00")
                 )
-
                 if now > premium_until:
                     is_premium = False
-
                     supabase.table("users").update({
                         "is_premium": False,
                         "premium_until": None
@@ -224,7 +181,6 @@ async def check_and_update_limit(user_id: int):
 
             if now - last_reset >= timedelta(hours=24):
                 downloads = 0
-
                 supabase.table("users").update({
                     "downloads_count": 0,
                     "last_reset": now.isoformat()
@@ -234,7 +190,6 @@ async def check_and_update_limit(user_id: int):
 
         if downloads >= limit:
             tarif_name = "🌟 Premium" if is_premium else "Free"
-
             return False, (
                 f"❌ Лимит исчерпан!\n\n"
                 f"Тариф: {tarif_name}\n"
@@ -243,22 +198,16 @@ async def check_and_update_limit(user_id: int):
                 f"Оформите Premium через /buy за 100 Stars!"
             )
 
-        new_downloads = downloads + 1
-
         supabase.table("users").update({
-            "downloads_count": new_downloads
+            "downloads_count": downloads + 1
         }).eq("user_id", user_id).execute()
 
         return True, ""
 
     except Exception:
-        logger.exception("Ошибка Supabase")
+        logger.exception("Ошибка Supabase при проверке лимита")
         return True, ""
 
-
-# ==========================================
-# 8. START
-# ==========================================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -285,15 +234,9 @@ async def cmd_start(message: types.Message):
     )
 
 
-# ==========================================
-# 9. SUBSCRIPTION BUTTON
-# ==========================================
-
 @dp.callback_query(lambda c: c.data == "check_sub")
 async def process_check_sub(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-
-    if await check_subscriptions(user_id):
+    if await check_subscriptions(callback.from_user.id):
         await callback.message.edit_text(
             "✅ Спасибо за подписку!\n\n"
             "Теперь отправьте ссылку на видео."
@@ -306,10 +249,6 @@ async def process_check_sub(callback: types.CallbackQuery):
         )
 
 
-# ==========================================
-# 10. PREMIUM PURCHASE
-# ==========================================
-
 @dp.message(Command("buy"))
 async def cmd_buy(message: types.Message):
     await message.answer_invoice(
@@ -320,9 +259,7 @@ async def cmd_buy(message: types.Message):
         ),
         payload="premium_30_days",
         currency="XTR",
-        prices=[
-            LabeledPrice(label="30 дней Premium", amount=100)
-        ]
+        prices=[LabeledPrice(label="30 дней Premium", amount=100)]
     )
 
 
@@ -347,10 +284,8 @@ async def successful_payment_handler(message: types.Message):
                 },
                 on_conflict="user_id"
             ).execute()
-
         except Exception:
             logger.exception("Ошибка активации Premium")
-
             await message.answer(
                 "⚠️ Оплата получена, но возникла ошибка "
                 "активации Premium. Обратитесь в поддержку."
@@ -366,66 +301,40 @@ async def successful_payment_handler(message: types.Message):
     )
 
 
-# ==========================================
-# 11. VIDEO DOWNLOADER + BGUTIL PO TOKEN
-# ==========================================
-
 def download_video(url: str) -> str:
-
     unique_name = uuid.uuid4().hex
 
     ydl_opts = {
         "format": "best[ext=mp4]/best",
         "outtmpl": f"video_{unique_name}.%(ext)s",
-
         "overwrites": True,
-
         "quiet": False,
         "no_warnings": False,
         "verbose": True,
-
         "noplaylist": True,
         "retries": 3,
         "fragment_retries": 3,
         "extractor_retries": 3,
         "socket_timeout": 30,
 
-        # Браузерный User-Agent для совместимости с TikTok
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/140.0.0.0 Safari/537.36"
-            )
-        },
-
-        # YouTube player clients.
-        # PO Token provider BgUtils подключается отдельно через плагин.
         "extractor_args": {
             "youtube": {
-                "player_client": [
-                    "mweb",
-                    "tv",
-                    "web_safari"
-                ]
+                "player_client": ["mweb"]
             }
         }
     }
 
-    logger.info("Начинаем скачивание: %s", url)
+    logger.info("Начинаем скачивание ссылки: %s", url)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
+        if not info:
+            raise RuntimeError("yt-dlp не вернул информацию о видео")
         return ydl.prepare_filename(info)
 
 
-# ==========================================
-# 12. MESSAGE HANDLER
-# ==========================================
-
 @dp.message()
 async def handle_message(message: types.Message):
-
     if not message.text:
         await message.answer("Пожалуйста, отправьте ссылку на видео.")
         return
@@ -446,12 +355,11 @@ async def handle_message(message: types.Message):
         return
 
     allowed, limit_msg = await check_and_update_limit(user_id)
-
     if not allowed:
         await message.answer(limit_msg)
         return
 
-    msg = await message.answer("⏳ Скачиваю видео...")
+    status_msg = await message.answer("⏳ Скачиваю видео...")
     file_path = None
 
     try:
@@ -460,34 +368,29 @@ async def handle_message(message: types.Message):
         if not os.path.exists(file_path):
             raise FileNotFoundError("Скачанный видеофайл не найден.")
 
-        await msg.edit_text("📤 Загружаю видео в Telegram...")
-
-        video_file = types.FSInputFile(file_path)
-
-        await message.answer_video(video=video_file)
-        await msg.delete()
+        await status_msg.edit_text("📤 Загружаю видео в Telegram...")
+        await message.answer_video(video=types.FSInputFile(file_path))
+        await status_msg.delete()
 
     except Exception as e:
         logger.exception("Ошибка скачивания или отправки видео")
-
         error_text = str(e)
 
         if "Sign in to confirm" in error_text or "not a bot" in error_text:
             user_error = (
-                "YouTube временно блокирует автоматическую загрузку "
-                "и требует дополнительную проверку. Попробуйте позже "
-                "или отправьте ссылку на другое видео."
+                "YouTube требует дополнительную проверку. "
+                "PO Token не гарантирует снятие блокировки IP Render."
             )
         elif "Unexpected response from webpage request" in error_text:
             user_error = (
-                "TikTok вернул неожиданный ответ. "
-                "Попробуйте позже или отправьте другую ссылку."
+                "TikTok вернул страницу проверки вместо данных видео. "
+                "Это может быть ограничение IP или антибот-проверка."
             )
         else:
             user_error = error_text[:900]
 
         try:
-            await msg.edit_text(
+            await status_msg.edit_text(
                 "❌ Не удалось скачать или отправить видео.\n\n"
                 f"Причина: {user_error}"
             )
@@ -502,54 +405,27 @@ async def handle_message(message: types.Message):
                 logger.exception("Не удалось удалить видеофайл")
 
 
-# ==========================================
-# 13. BOT STARTUP
-# ==========================================
-
 async def main():
-
     try:
-        while True:
-            try:
-                logger.info("Проверка подключения к Telegram...")
+        logger.info("Проверка подключения к Telegram...")
+        me = await bot.get_me()
+        logger.info("Бот подключён: @%s", me.username)
 
-                me = await bot.get_me()
+        bot_ready.set()
+        logger.info("Запуск Telegram polling...")
 
-                logger.info("Бот подключён: @%s", me.username)
+        await dp.start_polling(
+            bot,
+            close_bot_session=False
+        )
 
-                bot_ready.set()
-
-                logger.info("Запуск Telegram polling...")
-
-                await dp.start_polling(
-                    bot,
-                    close_bot_session=False
-                )
-
-                logger.warning("Telegram polling завершился.")
-                break
-
-            except TelegramConflictError:
-                bot_ready.clear()
-
-                logger.critical(
-                    "ОШИБКА 409 CONFLICT: другой экземпляр бота "
-                    "уже получает обновления. Остановите лишний экземпляр."
-                )
-
-                raise
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception:
-                bot_ready.clear()
-
-                logger.exception(
-                    "Ошибка подключения к Telegram. Повтор через 15 секунд."
-                )
-
-                await asyncio.sleep(15)
+    except TelegramConflictError:
+        bot_ready.clear()
+        logger.critical(
+            "Telegram 409 CONFLICT: другой экземпляр этого же бота "
+            "уже получает updates. Оставьте polling только в одном сервисе Render."
+        )
+        raise
 
     finally:
         bot_ready.clear()
@@ -557,13 +433,8 @@ async def main():
         logger.info("Сессия Telegram закрыта.")
 
 
-# ==========================================
-# 14. ENTRY POINT
-# ==========================================
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-
     except KeyboardInterrupt:
         logger.info("Бот остановлен вручную.")
