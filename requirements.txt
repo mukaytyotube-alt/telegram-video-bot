@@ -1,3 +1,5 @@
+
 aiogram
 yt-dlp[default]
 supabase
+bgutil-ytdlp-pot-provider==2.0.2
