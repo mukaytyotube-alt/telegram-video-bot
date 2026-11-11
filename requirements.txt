@@ -1,7 +1,6 @@
 
---pre
 aiogram
 yt-dlp[default,curl-cffi]
 supabase
 bgutil-ytdlp-pot-provider==2.0.2
-httpx
+httpx==0.28.1
