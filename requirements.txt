@@ -1,5 +1,5 @@
-
+--pre
 aiogram
-yt-dlp[default]
+yt-dlp[default,curl-cffi]
 supabase
 bgutil-ytdlp-pot-provider==2.0.2
