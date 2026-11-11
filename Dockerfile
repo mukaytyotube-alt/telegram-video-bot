@@ -16,7 +16,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-RUN git clone --depth 1 --branch 1.3.1 \
+RUN git clone --depth 1 --branch 2.0.2 \
     https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
     /opt/bgutil
 
@@ -26,4 +26,4 @@ RUN cd /opt/bgutil/server \
 
 COPY . .
 
-CMD ["sh", "-c", "node /opt/bgutil/server/build/main.js & exec python main.py"]
+CMD ["sh", "-c", "node /opt/bgutil/server/build/main.js --host 127.0.0.1 & exec python main.py"]
