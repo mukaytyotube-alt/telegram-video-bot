@@ -380,7 +380,6 @@ def download_video(url: str) -> str:
 
         "overwrites": True,
 
-        # Диагностика yt-dlp
         "quiet": False,
         "no_warnings": False,
         "verbose": True,
@@ -391,7 +390,17 @@ def download_video(url: str) -> str:
         "extractor_retries": 3,
         "socket_timeout": 30,
 
-        # YouTube player clients
+        # Браузерный User-Agent для совместимости с TikTok
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            )
+        },
+
+        # YouTube player clients.
+        # PO Token provider BgUtils подключается отдельно через плагин.
         "extractor_args": {
             "youtube": {
                 "player_client": [
@@ -469,6 +478,11 @@ async def handle_message(message: types.Message):
                 "и требует дополнительную проверку. Попробуйте позже "
                 "или отправьте ссылку на другое видео."
             )
+        elif "Unexpected response from webpage request" in error_text:
+            user_error = (
+                "TikTok вернул неожиданный ответ. "
+                "Попробуйте позже или отправьте другую ссылку."
+            )
         else:
             user_error = error_text[:900]
 
@@ -520,7 +534,7 @@ async def main():
 
                 logger.critical(
                     "ОШИБКА 409 CONFLICT: другой экземпляр бота "
-                    "уже получает обновления."
+                    "уже получает обновления. Остановите лишний экземпляр."
                 )
 
                 raise
