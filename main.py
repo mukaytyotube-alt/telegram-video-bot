@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import asyncio
 import logging
@@ -56,6 +57,19 @@ if _COOKIES_SOURCE and os.path.exists(_COOKIES_SOURCE):
         logger.exception("Не удалось скопировать cookies")
 else:
     logger.warning("Файл cookies не найден: %s", _COOKIES_SOURCE)
+
+
+# JS-движок для YouTube (yt-dlp без него не может расшифровать ссылки).
+# Пакет "deno" из requirements.txt кладёт бинарник рядом с python.
+DENO_PATH = shutil.which("deno")
+if not DENO_PATH:
+    _candidate = os.path.join(os.path.dirname(sys.executable), "deno")
+    if os.path.exists(_candidate):
+        DENO_PATH = _candidate
+if DENO_PATH:
+    logger.info("JS runtime deno найден: %s", DENO_PATH)
+else:
+    logger.warning("JS runtime deno НЕ найден: YouTube может не работать")
 
 
 bot_ready = threading.Event()
@@ -382,6 +396,8 @@ def download_video(url: str) -> str:
         "socket_timeout": 30,
         "cookiefile": COOKIES_FILE or None,
     }
+    if DENO_PATH:
+        ydl_opts["js_runtimes"] = {"deno": {"path": DENO_PATH}}
 
     logger.info("Начинаем скачивание ссылки: %s", url)
 
