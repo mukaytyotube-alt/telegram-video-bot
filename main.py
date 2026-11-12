@@ -373,19 +373,14 @@ def download_video(url: str) -> str:
         ),
         "outtmpl": f"video_{unique_name}.%(ext)s",
         "overwrites": True,
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+        "no_warnings": False,
         "noplaylist": True,
         "retries": 3,
         "fragment_retries": 3,
         "extractor_retries": 3,
         "socket_timeout": 30,
         "cookiefile": COOKIES_FILE or None,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["mweb", "android"]
-            }
-        },
     }
 
     logger.info("Начинаем скачивание ссылки: %s", url)
