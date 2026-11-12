@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import logging
@@ -36,6 +35,14 @@ def log_package_version(package_name):
 logger.info("yt-dlp version: %s", yt_dlp.version.__version__)
 log_package_version("curl-cffi")
 log_package_version("bgutil-ytdlp-pot-provider")
+
+
+# ------------------- Настройки -------------------
+FREE_LIMIT = int(os.environ.get("FREE_LIMIT", "5"))
+PREMIUM_LIMIT = int(os.environ.get("PREMIUM_LIMIT", "50"))
+
+# Опционально: файл cookies в Netscape-формате (помогает против блокировок YouTube)
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "")
 
 
 bot_ready = threading.Event()
@@ -80,22 +87,35 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not TOKEN:
     raise ValueError("Не найден BOT_TOKEN!")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.warning("Supabase не настроен. Лимиты не будут сохраняться.")
-
-
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-supabase: Client = (
-    create_client(SUPABASE_URL, SUPABASE_KEY)
-    if SUPABASE_URL and SUPABASE_KEY
-    else None
-)
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase: Client | None = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    supabase = None
+    logger.warning("Supabase не настроен! Лимиты скачиваний ОТКЛЮЧЕНЫ.")
 
 
 CHANNEL_1 = "@digital_author_ai"
 CHANNEL_2 = "@Russia_RB"
+
+
+def detect_platform(url: str) -> str:
+    u = url.lower()
+    if "tiktok.com" in u:
+        return "TikTok 🎵"
+    if "instagram.com" in u:
+        return "Instagram Reels 📸"
+    if "youtube.com" in u or "youtu.be" in u:
+        return "YouTube ▶️"
+    if "facebook.com" in u or "fb.watch" in u:
+        return "Facebook"
+    if "vk.com" in u or "vkvideo.ru" in u:
+        return "VK"
+    if "x.com" in u or "twitter.com" in u:
+        return "X"
+    return "сайта"
 
 
 async def check_subscriptions(user_id: int) -> bool:
@@ -130,63 +150,93 @@ def get_sub_keyboard():
     return builder.as_markup()
 
 
-async def check_and_update_limit(user_id: int):
-    if not supabase:
-        return True, ""
+# ------------------- Работа с Supabase -------------------
 
+def _parse_dt(value):
+    if not value:
+        return None
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def db_get_user(user_id: int):
+    resp = supabase.table("users").select("*").eq("user_id", user_id).execute()
+    return resp.data[0] if resp.data else None
+
+
+def db_create_user(user_id: int):
     now = datetime.now(timezone.utc)
+    supabase.table("users").insert({
+        "user_id": user_id,
+        "downloads_count": 0,
+        "last_reset": now.isoformat(),
+        "is_premium": False,
+    }).execute()
+
+
+def db_reset_counter(user_id: int, now: datetime):
+    supabase.table("users").update({
+        "downloads_count": 0,
+        "last_reset": now.isoformat(),
+    }).eq("user_id", user_id).execute()
+
+
+def db_deactivate_premium(user_id: int):
+    supabase.table("users").update({
+        "is_premium": False,
+        "premium_until": None,
+    }).eq("user_id", user_id).execute()
+
+
+def db_increment(user_id: int):
+    user = db_get_user(user_id)
+    if user is None:
+        return
+    downloads = int(user.get("downloads_count") or 0)
+    supabase.table("users").update({
+        "downloads_count": downloads + 1
+    }).eq("user_id", user_id).execute()
+
+
+def db_activate_premium(user_id: int, until: datetime):
+    supabase.table("users").upsert({
+        "user_id": user_id,
+        "is_premium": True,
+        "premium_until": until.isoformat(),
+    }, on_conflict="user_id").execute()
+
+
+async def check_limit(user_id: int):
+    """Возвращает (allowed, message, remaining). Ничего НЕ инкрементирует."""
+    if supabase is None:
+        return True, "", None
 
     try:
-        response = (
-            supabase.table("users")
-            .select("*")
-            .eq("user_id", user_id)
-            .execute()
-        )
-        user_data = response.data
-
-        if not user_data:
-            supabase.table("users").insert({
-                "user_id": user_id,
+        user = await asyncio.to_thread(db_get_user, user_id)
+        if user is None:
+            await asyncio.to_thread(db_create_user, user_id)
+            user = {
                 "downloads_count": 0,
-                "last_reset": now.isoformat(),
-                "is_premium": False
-            }).execute()
+                "is_premium": False,
+                "last_reset": None,
+                "premium_until": None,
+            }
+
+        now = datetime.now(timezone.utc)
+
+        is_premium = bool(user.get("is_premium"))
+        premium_until = _parse_dt(user.get("premium_until"))
+        if is_premium and premium_until and now > premium_until:
+            await asyncio.to_thread(db_deactivate_premium, user_id)
             is_premium = False
+
+        last_reset = _parse_dt(user.get("last_reset")) or now
+        downloads = int(user.get("downloads_count") or 0)
+
+        if now - last_reset >= timedelta(hours=24):
             downloads = 0
-            last_reset = now
-        else:
-            user = user_data[0]
-            is_premium = user.get("is_premium", False)
-            downloads = user.get("downloads_count", 0)
+            await asyncio.to_thread(db_reset_counter, user_id, now)
 
-            last_reset_str = user.get("last_reset")
-            premium_until_str = user.get("premium_until")
-
-            last_reset = (
-                datetime.fromisoformat(last_reset_str.replace("Z", "+00:00"))
-                if last_reset_str else now
-            )
-
-            if is_premium and premium_until_str:
-                premium_until = datetime.fromisoformat(
-                    premium_until_str.replace("Z", "+00:00")
-                )
-                if now > premium_until:
-                    is_premium = False
-                    supabase.table("users").update({
-                        "is_premium": False,
-                        "premium_until": None
-                    }).eq("user_id", user_id).execute()
-
-            if now - last_reset >= timedelta(hours=24):
-                downloads = 0
-                supabase.table("users").update({
-                    "downloads_count": 0,
-                    "last_reset": now.isoformat()
-                }).eq("user_id", user_id).execute()
-
-        limit = 50 if is_premium else 5
+        limit = PREMIUM_LIMIT if is_premium else FREE_LIMIT
 
         if downloads >= limit:
             tarif_name = "🌟 Premium" if is_premium else "Free"
@@ -194,20 +244,22 @@ async def check_and_update_limit(user_id: int):
                 f"❌ Лимит исчерпан!\n\n"
                 f"Тариф: {tarif_name}\n"
                 f"Использовано: {downloads}/{limit}\n\n"
-                f"Обновление через 24 часа.\n"
+                f"Лимит обновится через 24 часа.\n"
                 f"Оформите Premium через /buy за 100 Stars!"
-            )
+            ), 0
 
-        supabase.table("users").update({
-            "downloads_count": downloads + 1
-        }).eq("user_id", user_id).execute()
-
-        return True, ""
+        return True, "", limit - downloads
 
     except Exception:
         logger.exception("Ошибка Supabase при проверке лимита")
-        return True, ""
+        # fail-closed: при ошибке БД НЕ даём безлимит, а сообщаем пользователю
+        return False, (
+            "⚠️ Не удалось проверить лимит скачиваний (ошибка базы данных).\n"
+            "Попробуйте позже или обратитесь в поддержку."
+        ), None
 
+
+# ------------------- Команды -------------------
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -223,11 +275,11 @@ async def cmd_start(message: types.Message):
 
     await message.answer(
         "👋 Привет! Отправь мне ссылку на видео "
-        "(YouTube, TikTok и другие площадки), "
+        "(TikTok, Instagram Reels, YouTube Shorts), "
         "и я скачаю его для тебя.\n\n"
-        "📦 **Тарифы:**\n"
-        "• **Free:** 5 скачиваний в сутки\n"
-        "• **Premium:** 50 скачиваний в сутки\n"
+        f"📦 **Тарифы:**\n"
+        f"• **Free:** {FREE_LIMIT} скачиваний в сутки\n"
+        f"• **Premium:** {PREMIUM_LIMIT} скачиваний в сутки\n"
         "• **Стоимость Premium:** 100 Stars / 30 дней\n\n"
         "💳 Используй команду /buy, чтобы купить Premium.",
         parse_mode="Markdown"
@@ -255,7 +307,7 @@ async def cmd_buy(message: types.Message):
         title="🌟 Premium подписка (30 дней)",
         description=(
             "Увеличение лимита скачиваний "
-            "до 50 видео в сутки на 30 дней."
+            f"до {PREMIUM_LIMIT} видео в сутки на 30 дней."
         ),
         payload="premium_30_days",
         currency="XTR",
@@ -276,14 +328,7 @@ async def successful_payment_handler(message: types.Message):
 
     if supabase:
         try:
-            supabase.table("users").upsert(
-                {
-                    "user_id": user_id,
-                    "is_premium": True,
-                    "premium_until": premium_until.isoformat()
-                },
-                on_conflict="user_id"
-            ).execute()
+            await asyncio.to_thread(db_activate_premium, user_id, premium_until)
         except Exception:
             logger.exception("Ошибка активации Premium")
             await message.answer(
@@ -295,33 +340,39 @@ async def successful_payment_handler(message: types.Message):
     await message.answer(
         "🎉 **Оплата прошла успешно!**\n\n"
         "Вам активирован тариф 🌟 **Premium** на 30 дней.\n\n"
-        "Ваш лимит увеличен до **50 скачиваний в сутки**.\n"
+        f"Ваш лимит увеличен до **{PREMIUM_LIMIT} скачиваний в сутки**.\n"
         "Приятного использования!",
         parse_mode="Markdown"
     )
 
 
+# ------------------- Скачивание -------------------
+
 def download_video(url: str) -> str:
     unique_name = uuid.uuid4().hex
 
     ydl_opts = {
-        "format": "best[ext=mp4]/best",
+        # лимит бота Telegram — 50 МБ, поэтому ищем файл < 45 МБ
+        "format": (
+            "best[ext=mp4][filesize_approx<45M]/"
+            "best[filesize_approx<45M]/"
+            "worst[ext=mp4]/worst/best"
+        ),
         "outtmpl": f"video_{unique_name}.%(ext)s",
         "overwrites": True,
-        "quiet": False,
-        "no_warnings": False,
-        "verbose": True,
+        "quiet": True,
+        "no_warnings": True,
         "noplaylist": True,
         "retries": 3,
         "fragment_retries": 3,
         "extractor_retries": 3,
         "socket_timeout": 30,
-
+        "cookiefile": COOKIES_FILE or None,
         "extractor_args": {
             "youtube": {
-                "player_client": ["mweb"]
+                "player_client": ["mweb", "android"]
             }
-        }
+        },
     }
 
     logger.info("Начинаем скачивание ссылки: %s", url)
@@ -354,12 +405,13 @@ async def handle_message(message: types.Message):
         await message.answer("Пожалуйста, отправьте корректную ссылку.")
         return
 
-    allowed, limit_msg = await check_and_update_limit(user_id)
+    allowed, limit_msg, remaining = await check_limit(user_id)
     if not allowed:
         await message.answer(limit_msg)
         return
 
-    status_msg = await message.answer("⏳ Скачиваю видео...")
+    platform = detect_platform(url)
+    status_msg = await message.answer(f"⏳ Скачиваю видео с {platform}...")
     file_path = None
 
     try:
@@ -372,19 +424,33 @@ async def handle_message(message: types.Message):
         await message.answer_video(video=types.FSInputFile(file_path))
         await status_msg.delete()
 
+        # Считаем скачивание ТОЛЬКО после успешной отправки
+        if supabase is not None:
+            try:
+                await asyncio.to_thread(db_increment, user_id)
+            except Exception:
+                logger.exception("Не удалось увеличить счётчик скачиваний")
+
+        if remaining is not None:
+            await message.answer(
+                f"✅ Готово! Осталось скачиваний сегодня: {remaining - 1}"
+            )
+
     except Exception as e:
         logger.exception("Ошибка скачивания или отправки видео")
         error_text = str(e)
 
         if "Sign in to confirm" in error_text or "not a bot" in error_text:
             user_error = (
-                "YouTube требует дополнительную проверку. "
-                "PO Token не гарантирует снятие блокировки IP Render."
+                "YouTube заблокировал скачивание с IP сервера. "
+                "Попробуйте позже или используйте TikTok/Reels."
             )
-        elif "Unexpected response from webpage request" in error_text:
+        elif "File is too large" in error_text or "Request Entity Too Large" in error_text:
+            user_error = "Видео слишком большое для отправки в Telegram (лимит 50 МБ)."
+        elif "Unexpected response from webpage" in error_text:
             user_error = (
-                "TikTok вернул страницу проверки вместо данных видео. "
-                "Это может быть ограничение IP или антибот-проверка."
+                "Сайт вернул страницу проверки вместо данных видео. "
+                "Возможно, ограничение IP сервера или антибот-проверка."
             )
         else:
             user_error = error_text[:900]
