@@ -74,6 +74,14 @@ else:
 
 bot_ready = threading.Event()
 
+# Экономия памяти (бесплатный Render = 512 МБ):
+# - одновременно качаем только одно видео;
+# - ограничиваем память JS-движка Deno (0 = не ограничивать).
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
+DENO_MAX_HEAP_MB = int(os.environ.get("DENO_MAX_HEAP_MB", "256"))
+if DENO_MAX_HEAP_MB > 0 and "DENO_V8_FLAGS" not in os.environ:
+    os.environ["DENO_V8_FLAGS"] = f"--max-old-space-size={DENO_MAX_HEAP_MB}"
+
 
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -381,9 +389,10 @@ def download_video(url: str) -> str:
     ydl_opts = {
         # лимит бота Telegram — 50 МБ, поэтому ищем файл < 45 МБ
         "format": (
-            "best[ext=mp4][filesize_approx<45M]/"
-            "best[filesize_approx<45M]/"
-            "worst[ext=mp4]/worst/best"
+            "best[ext=mp4][height<=480?][filesize_approx<45M]/"
+            "best[ext=mp4][height<=480?]/"
+            "best[height<=480?][filesize_approx<45M]/"
+            "worst[ext=mp4]/worst"
         ),
         "outtmpl": f"video_{unique_name}.%(ext)s",
         "overwrites": True,
@@ -439,7 +448,8 @@ async def handle_message(message: types.Message):
     file_path = None
 
     try:
-        file_path = await asyncio.to_thread(download_video, url)
+        async with DOWNLOAD_SEMAPHORE:
+            file_path = await asyncio.to_thread(download_video, url)
 
         if not os.path.exists(file_path):
             raise FileNotFoundError("Скачанный видеофайл не найден.")
