@@ -1,4 +1,5 @@
 import os
+import shutil
 import asyncio
 import logging
 import threading
@@ -41,8 +42,20 @@ log_package_version("bgutil-ytdlp-pot-provider")
 FREE_LIMIT = int(os.environ.get("FREE_LIMIT", "5"))
 PREMIUM_LIMIT = int(os.environ.get("PREMIUM_LIMIT", "50"))
 
-# Опционально: файл cookies в Netscape-формате (помогает против блокировок YouTube)
-COOKIES_FILE = os.environ.get("COOKIES_FILE", "")
+# Файл cookies в Netscape-формате (помогает против блокировок YouTube).
+# На Render Secret Files лежат в /etc/secrets/ и доступны только для чтения,
+# а yt-dlp пытается писать в cookie-файл, поэтому копируем его в /tmp.
+_COOKIES_SOURCE = os.environ.get("COOKIES_FILE", "/etc/secrets/cookies.txt")
+COOKIES_FILE = ""
+if _COOKIES_SOURCE and os.path.exists(_COOKIES_SOURCE):
+    try:
+        shutil.copy(_COOKIES_SOURCE, "/tmp/cookies.txt")
+        COOKIES_FILE = "/tmp/cookies.txt"
+        logger.info("Cookies загружены из %s", _COOKIES_SOURCE)
+    except Exception:
+        logger.exception("Не удалось скопировать cookies")
+else:
+    logger.warning("Файл cookies не найден: %s", _COOKIES_SOURCE)
 
 
 bot_ready = threading.Event()
