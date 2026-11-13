@@ -198,7 +198,10 @@ def get_shorts_keyboard():
 def _parse_dt(value):
     if not value:
         return None
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    result = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=timezone.utc)
+    return result
 
 
 def db_get_user(user_id: int):
@@ -241,11 +244,24 @@ def db_increment(user_id: int):
 
 
 def db_activate_premium(user_id: int, until: datetime):
-    supabase.table("users").upsert({
-        "user_id": user_id,
+    """Включает Premium. Если пользователя нет в users — создаёт с нормальным last_reset."""
+    now = datetime.now(timezone.utc)
+    user = db_get_user(user_id)
+    data = {
         "is_premium": True,
         "premium_until": until.isoformat(),
-    }, on_conflict="user_id").execute()
+    }
+    if user is None:
+        data.update({
+            "user_id": user_id,
+            "downloads_count": 0,
+            "last_reset": now.isoformat(),
+        })
+        supabase.table("users").insert(data).execute()
+    else:
+        if not user.get("last_reset"):
+            data["last_reset"] = now.isoformat()
+        supabase.table("users").update(data).eq("user_id", user_id).execute()
 
 
 async def check_limit(user_id: int):
@@ -370,15 +386,34 @@ async def pre_checkout_handler(query: PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def successful_payment_handler(message: types.Message):
+    p = message.successful_payment
     user_id = message.from_user.id
-    now = datetime.now(timezone.utc)
-    premium_until = now + timedelta(days=30)
+
+    # charge_id нужен для возврата Stars — всегда пишем в лог
+    logger.info(
+        "PAYMENT user=%s charge=%s stars=%s",
+        user_id, p.telegram_payment_charge_id, p.total_amount
+    )
+
+    if p.invoice_payload != "premium_30_days" or p.currency != "XTR":
+        logger.error("Некорректный платёж: %s", p)
+        return
 
     if supabase:
         try:
-            await asyncio.to_thread(db_activate_premium, user_id, premium_until)
+            now = datetime.now(timezone.utc)
+            existing = await asyncio.to_thread(db_get_user, user_id)
+            old_until = _parse_dt(existing.get("premium_until")) if existing else None
+            # продлеваем от текущего конца, если подписка ещё активна
+            base = old_until if old_until and old_until > now else now
+            await asyncio.to_thread(
+                db_activate_premium, user_id, base + timedelta(days=30)
+            )
         except Exception:
-            logger.exception("Ошибка активации Premium")
+            logger.exception(
+                "Ошибка активации Premium, charge=%s",
+                p.telegram_payment_charge_id
+            )
             await message.answer(
                 "⚠️ Оплата получена, но возникла ошибка "
                 "активации Premium. Обратитесь в поддержку."
