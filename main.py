@@ -1,5 +1,4 @@
 import os
-import sys
 import shutil
 import asyncio
 import logging
@@ -8,8 +7,10 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import metadata
+from urllib.parse import urlparse
 
 import yt_dlp
+from yt_dlp.utils import DownloadError
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -36,14 +37,21 @@ def log_package_version(package_name):
 
 logger.info("yt-dlp version: %s", yt_dlp.version.__version__)
 log_package_version("curl-cffi")
-log_package_version("bgutil-ytdlp-pot-provider")
 
 
 # ------------------- Настройки -------------------
 FREE_LIMIT = int(os.environ.get("FREE_LIMIT", "5"))
 PREMIUM_LIMIT = int(os.environ.get("PREMIUM_LIMIT", "50"))
 
-# Файл cookies в Netscape-формате (помогает против блокировок YouTube).
+# Бот Telegram не принимает файлы больше 50 МБ.
+# Формат выбираем с запасом (45 МБ), а готовый файл проверяем по жёсткому лимиту.
+MAX_VIDEO_BYTES = 45 * 1024 * 1024
+TELEGRAM_UPLOAD_LIMIT = 50 * 1024 * 1024
+
+# YouTube Shorts скачиваются в отдельном боте
+SHORTS_BOT_URL = "https://t.me/ShortYTDownloadBot"
+
+# Файл cookies в Netscape-формате (нужен только если сайт просит вход).
 # На Render Secret Files лежат в /etc/secrets/ и доступны только для чтения,
 # а yt-dlp пытается писать в cookie-файл, поэтому копируем его в /tmp.
 _COOKIES_SOURCE = os.environ.get("COOKIES_FILE", "/etc/secrets/cookies.txt")
@@ -56,20 +64,7 @@ if _COOKIES_SOURCE and os.path.exists(_COOKIES_SOURCE):
     except Exception:
         logger.exception("Не удалось скопировать cookies")
 else:
-    logger.warning("Файл cookies не найден: %s", _COOKIES_SOURCE)
-
-
-# JS-движок для YouTube (yt-dlp без него не может расшифровать ссылки).
-# Пакет "deno" из requirements.txt кладёт бинарник рядом с python.
-DENO_PATH = shutil.which("deno")
-if not DENO_PATH:
-    _candidate = os.path.join(os.path.dirname(sys.executable), "deno")
-    if os.path.exists(_candidate):
-        DENO_PATH = _candidate
-if DENO_PATH:
-    logger.info("JS runtime deno найден: %s", DENO_PATH)
-else:
-    logger.warning("JS runtime deno НЕ найден: YouTube может не работать")
+    logger.info("Файл cookies не найден (%s) — работаем без него", _COOKIES_SOURCE)
 
 
 bot_ready = threading.Event()
@@ -134,8 +129,6 @@ def detect_platform(url: str) -> str:
         return "TikTok 🎵"
     if "instagram.com" in u:
         return "Instagram Reels 📸"
-    if "youtube.com" in u or "youtu.be" in u:
-        return "YouTube ▶️"
     if "facebook.com" in u or "fb.watch" in u:
         return "Facebook"
     if "vk.com" in u or "vkvideo.ru" in u:
@@ -143,6 +136,19 @@ def detect_platform(url: str) -> str:
     if "x.com" in u or "twitter.com" in u:
         return "X"
     return "сайта"
+
+
+def is_tiktok_url(url: str) -> bool:
+    return "tiktok.com" in url.lower()
+
+
+def is_youtube_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return (
+        host == "youtu.be"
+        or host == "youtube.com"
+        or host.endswith(".youtube.com")
+    )
 
 
 async def check_subscriptions(user_id: int) -> bool:
@@ -173,6 +179,16 @@ def get_sub_keyboard():
     builder.row(types.InlineKeyboardButton(
         text="✅ Я подписался(-ась)",
         callback_data="check_sub"
+    ))
+    return builder.as_markup()
+
+
+def get_shorts_keyboard():
+    """Кнопка, которая открывает отдельного бота для YouTube Shorts."""
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(
+        text="▶️ Скачать Shorts",
+        url=SHORTS_BOT_URL
     ))
     return builder.as_markup()
 
@@ -302,14 +318,17 @@ async def cmd_start(message: types.Message):
 
     await message.answer(
         "👋 Привет! Отправь мне ссылку на видео "
-        "(TikTok, Instagram Reels, YouTube Shorts), "
+        "(TikTok, Instagram Reels), "
         "и я скачаю его для тебя.\n\n"
+        "▶️ YouTube Shorts скачиваются в отдельном боте — "
+        "нажми кнопку ниже.\n\n"
         f"📦 **Тарифы:**\n"
         f"• **Free:** {FREE_LIMIT} скачиваний в сутки\n"
         f"• **Premium:** {PREMIUM_LIMIT} скачиваний в сутки\n"
         "• **Стоимость Premium:** 100 Stars / 30 дней\n\n"
         "💳 Используй команду /buy, чтобы купить Premium.",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=get_shorts_keyboard()
     )
 
 
@@ -318,7 +337,9 @@ async def process_check_sub(callback: types.CallbackQuery):
     if await check_subscriptions(callback.from_user.id):
         await callback.message.edit_text(
             "✅ Спасибо за подписку!\n\n"
-            "Теперь отправьте ссылку на видео."
+            "Теперь отправьте ссылку на видео из TikTok или Instagram Reels.\n"
+            "YouTube Shorts скачиваются в отдельном боте — кнопка ниже.",
+            reply_markup=get_shorts_keyboard()
         )
         await callback.answer()
     else:
@@ -375,29 +396,113 @@ async def successful_payment_handler(message: types.Message):
 
 # ------------------- Скачивание -------------------
 
-def download_video(url: str) -> str:
+# Кодеки, которые Telegram (особенно веб-версия) проигрывает хуже, чем H.264
+_EXOTIC_CODECS = (
+    "h265", "hevc", "hvc1", "hev1", "bytevc1",
+    "av01", "av1", "vp9", "vp09", "vp8",
+)
+
+
+def _is_watermarked(f: dict) -> bool:
+    """Формат TikTok с водяным знаком.
+
+    yt-dlp помечает его как "Download video, watermarked" (format_id
+    download / download_addr). Именно его раньше и подхватывал запасной
+    вариант "worst" — отсюда водяные знаки "не всегда".
+    """
+    note = str(f.get("format_note") or "").lower()
+    format_id = str(f.get("format_id") or "").lower()
+    url = str(f.get("url") or "").lower()
+    return (
+        "watermark" in note
+        or format_id in ("download", "download_addr")
+        or "watermark=1" in url
+    )
+
+
+def _is_exotic_codec(f: dict) -> bool:
+    vcodec = str(f.get("vcodec") or "").lower()
+    return any(codec in vcodec for codec in _EXOTIC_CODECS)
+
+
+def _format_size(f: dict):
+    return f.get("filesize") or f.get("filesize_approx")
+
+
+def _pick_format(candidates: list):
+    """Из списка (лучшие первыми) выбирает формат для Telegram."""
+    if not candidates:
+        return None
+
+    # mp4 и обычный H.264 — первыми; порядок по качеству от yt-dlp сохраняется
+    ranked = sorted(
+        candidates,
+        key=lambda f: (f.get("ext") != "mp4", _is_exotic_codec(f))
+    )
+
+    # лучший по качеству, который влезает в лимит (неизвестный размер — ок)
+    for f in ranked:
+        if (_format_size(f) or 0) <= MAX_VIDEO_BYTES:
+            return f
+
+    # всё тяжелее лимита — берём самый лёгкий
+    return min(ranked, key=lambda f: _format_size(f) or 0)
+
+
+def make_format_selector(avoid_watermark: bool, state: dict):
+    """Свой выбор формата для yt-dlp.
+
+    Для TikTok версия с водяным знаком берётся ТОЛЬКО если других нет —
+    тогда state["watermarked"] = True.
+    """
+
+    def selector(ctx):
+        # yt-dlp отдаёт форматы от худшего к лучшему — разворачиваем
+        formats = list(ctx.get("formats") or [])[::-1]
+
+        # как у "best": только готовые файлы сразу с видео и звуком
+        formats = [
+            f for f in formats
+            if f.get("vcodec") != "none" and f.get("acodec") != "none"
+        ]
+
+        if avoid_watermark:
+            groups = [
+                ([f for f in formats if not _is_watermarked(f)], False),
+                ([f for f in formats if _is_watermarked(f)], True),
+            ]
+        else:
+            groups = [(formats, False)]
+
+        for group, watermarked in groups:
+            chosen = _pick_format(group)
+            if chosen is not None:
+                state["watermarked"] = watermarked
+                yield chosen
+                return
+
+    return selector
+
+
+def _download(url: str, fmt) -> str:
     unique_name = uuid.uuid4().hex
 
     ydl_opts = {
-        # лимит бота Telegram — 50 МБ, поэтому ищем файл < 45 МБ
-        "format": (
-            "best[ext=mp4][filesize_approx<45M]/"
-            "best[filesize_approx<45M]/"
-            "worst[ext=mp4]/worst/best"
-        ),
+        "format": fmt,
         "outtmpl": f"video_{unique_name}.%(ext)s",
         "overwrites": True,
         "quiet": False,
         "no_warnings": False,
         "noplaylist": True,
+        # если по ссылке несколько видео (карусель, профиль) — берём только первое
+        "playlist_items": "1",
+        "merge_output_format": "mp4",
         "retries": 3,
         "fragment_retries": 3,
         "extractor_retries": 3,
         "socket_timeout": 30,
         "cookiefile": COOKIES_FILE or None,
     }
-    if DENO_PATH:
-        ydl_opts["js_runtimes"] = {"deno": {"path": DENO_PATH}}
 
     logger.info("Начинаем скачивание ссылки: %s", url)
 
@@ -405,7 +510,34 @@ def download_video(url: str) -> str:
         info = ydl.extract_info(url, download=True)
         if not info:
             raise RuntimeError("yt-dlp не вернул информацию о видео")
+
+        if info.get("entries"):
+            entries = [e for e in info["entries"] if e]
+            if not entries:
+                raise RuntimeError("yt-dlp не нашёл видео по этой ссылке")
+            info = entries[0]
+
+        for item in info.get("requested_downloads") or []:
+            path = item.get("filepath")
+            if path and os.path.exists(path):
+                return path
+
         return ydl.prepare_filename(info)
+
+
+def download_video(url: str):
+    """Скачивает видео. Возвращает (путь к файлу, остался ли водяной знак)."""
+    state = {"watermarked": False}
+    selector = make_format_selector(is_tiktok_url(url), state)
+
+    try:
+        return _download(url, selector), state["watermarked"]
+    except DownloadError as e:
+        if "Requested format is not available" not in str(e):
+            raise
+        logger.warning("Готового файла со звуком нет — пробуем собрать видео и звук")
+
+    return _download(url, "bv*+ba/b"), False
 
 
 @dp.message()
@@ -429,6 +561,16 @@ async def handle_message(message: types.Message):
         await message.answer("Пожалуйста, отправьте корректную ссылку.")
         return
 
+    # YouTube здесь больше не скачиваем — отправляем в отдельного бота.
+    # Лимит при этом не тратится.
+    if is_youtube_url(url):
+        await message.answer(
+            "▶️ YouTube Shorts скачиваются в отдельном боте.\n\n"
+            "Нажмите кнопку ниже и отправьте ссылку туда.",
+            reply_markup=get_shorts_keyboard()
+        )
+        return
+
     allowed, limit_msg, remaining = await check_limit(user_id)
     if not allowed:
         await message.answer(limit_msg)
@@ -439,10 +581,13 @@ async def handle_message(message: types.Message):
     file_path = None
 
     try:
-        file_path = await asyncio.to_thread(download_video, url)
+        file_path, watermarked = await asyncio.to_thread(download_video, url)
 
         if not os.path.exists(file_path):
             raise FileNotFoundError("Скачанный видеофайл не найден.")
+
+        if os.path.getsize(file_path) > TELEGRAM_UPLOAD_LIMIT:
+            raise RuntimeError("File is too large")
 
         await status_msg.edit_text("📤 Загружаю видео в Telegram...")
         await message.answer_video(video=types.FSInputFile(file_path))
@@ -455,6 +600,12 @@ async def handle_message(message: types.Message):
             except Exception:
                 logger.exception("Не удалось увеличить счётчик скачиваний")
 
+        if watermarked:
+            await message.answer(
+                "⚠️ TikTok отдал только версию с водяным знаком — "
+                "убрать его в этот раз не получилось."
+            )
+
         if remaining is not None:
             await message.answer(
                 f"✅ Готово! Осталось скачиваний сегодня: {remaining - 1}"
@@ -464,12 +615,7 @@ async def handle_message(message: types.Message):
         logger.exception("Ошибка скачивания или отправки видео")
         error_text = str(e)
 
-        if "Sign in to confirm" in error_text or "not a bot" in error_text:
-            user_error = (
-                "YouTube заблокировал скачивание с IP сервера. "
-                "Попробуйте позже или используйте TikTok/Reels."
-            )
-        elif "File is too large" in error_text or "Request Entity Too Large" in error_text:
+        if "File is too large" in error_text or "Request Entity Too Large" in error_text:
             user_error = "Видео слишком большое для отправки в Telegram (лимит 50 МБ)."
         elif "Unexpected response from webpage" in error_text:
             user_error = (
